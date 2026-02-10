@@ -1,403 +1,511 @@
-import os
+"""
+Infant Length Measurement System using OpenPose and YOLO
+
+This module provides functionality for measuring premature infant crown-to-heel length
+using computer vision techniques. It combines YOLO object detection with OpenPose pose
+estimation to identify infant body keypoints and calculate physical measurements.
+
+Key Features:
+    - Detects 15cm reference object (spatula) for scale calibration
+    - Uses YOLO for person detection and bounding box extraction
+    - Employs OpenPose for detailed body, face, and hand keypoint detection
+    - Calculates vertical distance from head to heel with real-world conversion
+
+Dependencies:
+    - OpenCV (cv2): Image processing
+    - NumPy: Numerical computations
+    - Ultralytics YOLO: Object detection
+    - PyOpenPose: Pose estimation
+
+Author: OpenPose Project
+Date: 2026
+"""
+
 import sys
+import os
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# OpenPose python wrapper path
-sys.path.append(r"C:\openpose_build\openpose\build\python\openpose\Release")
+# Add OpenPose Python bindings to system path
+sys.path.append(r'C:\openpose_build\openpose\build\python\openpose\Release')
 import pyopenpose as op
 
-# ==============================
-# SETTINGS
-# ==============================
-COCO_MODEL = "yolov8n.pt"     # COCO person detector
-SPATULA_MODEL = "best.pt"     # your custom model (spatula detector)
-SPATULA_CLASS_ID = 1          # in your best.pt: 1 = spatula
-SPATULA_LENGTH_CM = 15.0
-
-OPENPOSE_MODELS = r"C:\openpose_build\openpose\models"
-
-RESIZE_WIDTH = 640            # keep aspect ratio
-BBOX_MARGIN = 0.05            # bbox expansion
-BBOX_TOP_CROP = 0.06          # remove top part to avoid sheet edges
-
-KP_CONF_THR = 0.03            # OpenPose keypoint confidence threshold
-
-# BODY_25 indices
-MID_HIP = 8
-
-# Right leg
-R_HIP, R_KNEE, R_ANKLE = 9, 10, 11
-R_HEEL = 24
-
-# Left leg
-L_HIP, L_KNEE, L_ANKLE = 12, 13, 14
-L_HEEL = 21
-
-# Face/Head anchor keypoints (BODY_25)
-NOSE, NECK = 0, 1
-REYE, LEYE, REAR, LEAR = 15, 16, 17, 18
+# Global variable to store calculated infant height in centimeters
+height_cm = 0
 
 
-# ==============================
-# HELPERS
-# ==============================
-def kp_ok(kp, thr=KP_CONF_THR):
-    return kp is not None and float(kp[2]) > thr
-
-
-def dist2d(a, b):
-    return float(np.linalg.norm(
-        np.array([a[0], a[1]], dtype=np.float32) -
-        np.array([b[0], b[1]], dtype=np.float32))
-    )
-
-
-def clamp_bbox(b, w, h):
-    x1, y1, x2, y2 = b
-    x1 = int(max(0, min(w - 1, x1)))
-    y1 = int(max(0, min(h - 1, y1)))
-    x2 = int(max(0, min(w - 1, x2)))
-    y2 = int(max(0, min(h - 1, y2)))
-    if x2 <= x1: x2 = min(w - 1, x1 + 1)
-    if y2 <= y1: y2 = min(h - 1, y1 + 1)
-    return (x1, y1, x2, y2)
-
-
-def add_margin_bbox(b, w, h, margin=BBOX_MARGIN):
-    x1, y1, x2, y2 = b
-    bw, bh = (x2 - x1), (y2 - y1)
-    mx, my = int(bw * margin), int(bh * margin)
-    return clamp_bbox((x1 - mx, y1 - my, x2 + mx, y2 + my), w, h)
-
-
-def crop_bbox_top(b, frac=BBOX_TOP_CROP):
-    if frac <= 0:
-        return b
-    x1, y1, x2, y2 = b
-    bh = (y2 - y1)
-    y1 = int(y1 + bh * frac)
-    return (x1, y1, x2, y2)
-
-
-def draw_dot(img, x, y, color, r=10, text=None):
-    x, y = int(x), int(y)
-    cv2.circle(img, (x, y), r + 6, (0, 0, 0), -1)
-    cv2.circle(img, (x, y), r, color, -1)
-    if text is not None:
-        cv2.putText(img, str(text), (x + r + 6, y - r - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 6)
-        cv2.putText(img, str(text), (x + r + 6, y - r - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-
-def draw_keypoints(img, kps, color=(0, 255, 0), conf_thr=KP_CONF_THR):
-    if kps is None:
-        return
-    for i in range(kps.shape[0]):
-        x, y, c = kps[i]
-        if float(c) <= conf_thr:
-            continue
-        draw_dot(img, x, y, color, r=10, text=i)
-
-
-def draw_line(img, p1, p2, color=(255, 255, 0), thick=5):
-    p1 = (int(p1[0]), int(p1[1]))
-    p2 = (int(p2[0]), int(p2[1]))
-    cv2.line(img, p1, p2, (0, 0, 0), thick + 6)
-    cv2.line(img, p1, p2, color, thick)
-
-
-def pick_best_box_by_area(results, target_cls, conf_min=0.15):
-    best = None
-    best_score = -1.0
-    for box in results.boxes.data:
-        x1, y1, x2, y2, conf, cls = box
-        if int(cls) != int(target_cls):
-            continue
-        conf = float(conf)
-        if conf < conf_min:
-            continue
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        area = max(1, x2 - x1) * max(1, y2 - y1)
-        score = area * conf
-        if score > best_score:
-            best_score = score
-            best = (x1, y1, x2, y2, conf)
-    return best
-
-
-# ==============================
-# HEAD: anchor + robust top-of-head
-# ==============================
-def get_head_anchor_from_pose(kps, bbox):
-    bx1, by1, bx2, by2 = bbox
-    head_ids = [NOSE, REYE, LEYE, REAR, LEAR]
-
-    pts = []
-    for idx in head_ids:
-        if idx < kps.shape[0] and kp_ok(kps[idx]):
-            pts.append((float(kps[idx][0]), float(kps[idx][1])))
-
-    if pts:
-        ax = int(np.mean([p[0] for p in pts]))
-        ay = int(min([p[1] for p in pts]))
-        return ax, ay
-
-    if NECK < kps.shape[0] and kp_ok(kps[NECK]):
-        ax = int(kps[NECK][0])
-        ay = int(kps[NECK][1] - 0.12 * (by2 - by1))
-        ay = max(by1, ay)
-        return ax, ay
-
-    return int((bx1 + bx2) / 2), int(by1 + 0.12 * (by2 - by1))
-
-
-def find_top_of_head_edge(img_bgr, bbox, anchor_xy):
-    bx1, by1, bx2, by2 = bbox
-    h, w = img_bgr.shape[:2]
-    bx1, by1, bx2, by2 = clamp_bbox((bx1, by1, bx2, by2), w, h)
-
-    ax, ay = anchor_xy
-    ax = int(np.clip(ax, bx1, bx2))
-    ay = int(np.clip(ay, by1, by2))
-
-    roi = img_bgr[by1:by2, bx1:bx2].copy()
-    rh, rw = roi.shape[:2]
-    ax_r = ax - bx1
-    ay_r = ay - by1
-
-    y_end = max(5, min(ay_r, int(rh * 0.70)))
-
-    half_win = max(14, int(rw * 0.05))
-    xL = max(0, ax_r - half_win)
-    xR = min(rw - 1, ax_r + half_win)
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    mag = cv2.magnitude(gx, gy)
-    mag = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    window_w = max(1, xR - xL)
-    min_energy_pixels = max(8, int(window_w * 0.12))
-    thresh = 35
-
-    for yy in range(0, y_end):
-        row = mag[yy, xL:xR]
-        strong = np.count_nonzero(row > thresh)
-        if strong >= min_energy_pixels:
-            xs = np.where(row > thresh)[0]
-            x_mean = int(np.mean(xs)) + xL
-            return (bx1 + x_mean, by1 + yy)
-
-    return (ax, by1)
-
-
-# ==============================
-# LEG LENGTH (HEEL ONLY) + MAX(L,R)
-# ==============================
-def leg_length_polyline_to_heel(kps, hip_i, knee_i, ankle_i, heel_i):
+def get_spatula_Height(image_path=''):
     """
-    hip->knee->ankle in 2D + ankle->heel (ONLY heel, no toes).
-    Returns (leg_px, heel_point_or_None)
+    Detect and locate the 15cm reference object (spatula) in the image.
+    
+    This function uses a custom-trained YOLO model to detect a spatula or reference
+    object of known length (15cm) in the image. The detected object's bounding box
+    coordinates are used for scale calibration.
+    
+    Args:
+        image_path (str): Path to the image file to analyze
+        
+    Returns:
+        tuple: A tuple containing:
+            - top_point (tuple): (x, y) coordinates of the top-left corner, or None if not found
+            - bottom_point (tuple): (x, y) coordinates of the bottom-right corner, or None if not found
+            
+    Notes:
+        - The function expects a trained YOLO model file 'best.pt' in the current directory
+        - Class ID 1 is specifically associated with the 15cm reference object
+        - Prints detection details including confidence scores and coordinates
     """
-    if not (kp_ok(kps[hip_i]) and kp_ok(kps[knee_i]) and kp_ok(kps[ankle_i])):
+    try:
+        spatula_model_path = "best.pt"
+
+        if not os.path.exists(spatula_model_path):
+            print(f"Spatula model not found: {spatula_model_path}")
+            return None, None
+
+        print(f"Loading spatula detection model: {spatula_model_path}")
+        spatula_model = YOLO(spatula_model_path)
+
+        if hasattr(spatula_model, 'names'):
+            print(f"Model classes: {spatula_model.names}")
+
+        print(f"Detecting 15cm reference in: {os.path.basename(image_path)}")
+        results = spatula_model(image_path, verbose=False)[0]
+
+        total_detections = len(results.boxes)
+        print(f"Found {total_detections} object(s)")
+
+        if total_detections > 0:
+            for i, box in enumerate(results.boxes.data):
+                cls_id = int(box[5])
+                conf = float(box[4])
+                class_name = spatula_model.names.get(cls_id, f"class_{cls_id}") if hasattr(spatula_model,
+                                                                                           'names') else f"class_{cls_id}"
+                print(f"Object {i}: {class_name} (class {cls_id}), confidence={conf:.2f}")
+
+        for box in results.boxes.data:
+            x1, y1, x2, y2, conf, cls = box
+            cls_id = int(cls)
+
+            if cls_id == 1:
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                top_x, top_y = x1, y1
+                bottom_x, bottom_y = x2, y2
+                print(f"15cm Reference detected!")
+                print(f"Point 1: (x={top_x}, y={top_y})")
+                print(f"Point 2: (x={bottom_x}, y={bottom_y})")
+                print(f"Confidence: {conf:.2f}")
+                return (top_x, top_y), (bottom_x, bottom_y)
+
+        print("No spatula detected (class 1 not found)")
         return None, None
 
-    hip = kps[hip_i]
-    knee = kps[knee_i]
-    ankle = kps[ankle_i]
-
-    leg_px = dist2d(hip, knee) + dist2d(knee, ankle)
-
-    heel_pt = None
-    if heel_i < kps.shape[0] and kp_ok(kps[heel_i]):
-        heel_pt = kps[heel_i]
-        leg_px += dist2d(ankle, heel_pt)
-
-    return leg_px, heel_pt
+    except Exception as e:
+        print(f"Error detecting spatula: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
 
 
-# ==============================
-# MAIN
-# ==============================
-def cal_height(image_path: str):
+def draw_keypoints(image, keypoints, color=(0, 255, 0), radius=5, label=False):
+    """
+    Draw detected keypoints on an image with optional labels.
+    
+    This function visualizes pose keypoints by drawing colored circles at each keypoint
+    location. It can be used for body joints, facial landmarks, or hand keypoints.
+    
+    Args:
+        image (np.ndarray): The image array to draw on (modified in-place)
+        keypoints (np.ndarray): Array of keypoints with shape (N, 3) where each row
+                                contains [x, y, confidence]
+        color (tuple): BGR color tuple for the keypoint circles (default: green)
+        radius (int): Radius of the keypoint circles in pixels (default: 5)
+        label (bool): If True, draws keypoint index numbers next to each point (default: False)
+        
+    Returns:
+        None: Modifies the input image in-place
+        
+    Notes:
+        - Only draws keypoints with confidence > 0.05
+        - Adds a black outline around each circle for better visibility
+        - Labels are drawn in white with colored outline when enabled
+    """
+    if keypoints is None or len(keypoints) == 0:
+        return
+    for i in range(keypoints.shape[0]):
+        keypoint = keypoints[i].flatten()
+        if keypoint.shape[0] >= 3:
+            x, y, confidence = float(keypoint[0]), float(keypoint[1]), float(keypoint[2])
+            if confidence > 0.05:
+                cv2.circle(image, (int(x), int(y)), radius + 2, (0, 0, 0), -1)
+                cv2.circle(image, (int(x), int(y)), radius, color, -1)
+                if label:
+                    cv2.putText(image, str(i), (int(x) + 8, int(y) - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 2)
+                    cv2.putText(image, str(i), (int(x) + 8, int(y) - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+
+def distance(p1, p2):
+    """
+    Calculate Euclidean distance between two 2D points.
+    
+    Args:
+        p1 (tuple or list): First point coordinates (x1, y1)
+        p2 (tuple or list): Second point coordinates (x2, y2)
+        
+    Returns:
+        float: Euclidean distance between the two points in pixels
+        
+    Example:
+        >>> distance((0, 0), (3, 4))
+        5.0
+    """
+    return np.linalg.norm(np.array(p1) - np.array(p2))
+
+
+def cal_height(image_path=""):
+    """
+    Calculate infant crown-to-heel length from an image using pose estimation.
+    
+    This is the main processing function that orchestrates the entire measurement pipeline:
+    1. Resizes the input image to 640x480 for consistent processing
+    2. Detects the infant using YOLO person detection
+    3. Runs OpenPose to extract detailed body, face, and hand keypoints
+    4. Identifies the highest point (head) and lowest point (heel/ankle)
+    5. Calculates vertical distance in pixels
+    6. Converts to centimeters using the 15cm reference object
+    7. Generates an annotated output image with measurements
+    
+    Args:
+        image_path (str): Absolute path to the input image file
+        
+    Returns:
+        float or bool: 
+            - Measured infant length in centimeters if successful
+            - 0 if reference object not found (returns pixel measurement only)
+            - False if measurement failed
+            
+    Global Variables:
+        height_cm (float): Updated with the calculated height
+        
+    Output Files:
+        - Creates 'output/result_infant_measurement.png' with annotated results
+        - Creates resized version of input image with '_resized' suffix
+        
+    Notes:
+        - Requires 15cm reference object in image for accurate measurements
+        - Image is resized to 640x480 for consistent processing
+        - Uses BODY_25 model for pose estimation with face and hand detection
+        - Assumes infant is in supine position (lying flat)
+    """
+    global height_cm
+
+    # Setup directory paths
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(base_dir, "output")
-    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(base_dir, "output")
+    model_dir = r"C:\openpose_build\openpose\models"
+    yolo_model_path = os.path.join(base_dir, "yolov8n.pt")
 
-    img0 = cv2.imread(image_path)
-    if img0 is None:
-        print(f"❌ Could not read image: {image_path}")
+    # Load and validate input image
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"Could not read image: {image_path}")
         return False
 
-    oh, ow = img0.shape[:2]
-    print(f"Original image size: {ow}x{oh}")
+    original_h, original_w = img.shape[:2]
+    print(f"Original image size: {original_w}x{original_h}")
 
-    scale = RESIZE_WIDTH / float(ow)
-    new_h = int(oh * scale)
-    img = cv2.resize(img0, (RESIZE_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+    # Resize image to standard dimensions for consistent processing
+    target_w, target_h = 640, 480
+    resized_img = cv2.resize(img, (target_w, target_h))
 
-    name_root, ext = os.path.splitext(os.path.basename(image_path))
-    resized_path = os.path.join(os.path.dirname(image_path), f"{name_root}_resized{ext}")
-    cv2.imwrite(resized_path, img)
+    base_name = os.path.basename(image_path)
+    name_parts = os.path.splitext(base_name)
+    resized_name = name_parts[0] + "_resized" + name_parts[1]
+    resized_path = os.path.join(os.path.dirname(image_path), resized_name)
+
+    cv2.imwrite(resized_path, resized_img)
     print(f"Resized image saved to: {resized_path}")
-    print(f"New size: {RESIZE_WIDTH}x{new_h}")
+    print(f"New size: {target_w}x{target_h}")
 
-    H, W = img.shape[:2]
+    # Use resized image for all subsequent processing
+    image_path = resized_path
 
-    print("Loading YOLO models (COCO person + custom spatula)...")
-    coco_model = YOLO(os.path.join(base_dir, COCO_MODEL))
-    spatula_model = YOLO(os.path.join(base_dir, SPATULA_MODEL))
+    # Step 1: Person Detection using YOLO
+    try:
+        print("Loading YOLO model for person detection...")
+        if not os.path.exists(yolo_model_path):
+            print(f"Downloading yolov8n.pt to {yolo_model_path}...")
+            yolo_person_model = YOLO("yolov8n.pt")
+            import shutil
+            default_location = os.path.join(os.path.expanduser("~"), ".cache", "ultralytics", "yolov8n.pt")
+            if os.path.exists(default_location):
+                shutil.copy(default_location, yolo_model_path)
+                print(f"Model saved to project folder")
+        else:
+            print(f"Using existing yolov8n.pt: {yolo_model_path}")
+            yolo_person_model = YOLO(yolo_model_path)
 
-    coco_res = coco_model(resized_path, verbose=False)[0]
-    spat_res = spatula_model(resized_path, verbose=False)[0]
-
-    person = pick_best_box_by_area(coco_res, target_cls=0, conf_min=0.15)
-    if person is None:
-        print("❌ COCO did not detect a person.")
+        print("Running YOLO person detection at 640x480...")
+        yolo_results = yolo_person_model(image_path, imgsz=640, verbose=False)[0]
+    except Exception as e:
+        print(f"YOLO error: {e}")
         return False
 
-    px1, py1, px2, py2, pconf = person
-    bbox = add_margin_bbox((px1, py1, px2, py2), W, H, margin=BBOX_MARGIN)
-    bbox = crop_bbox_top(bbox, BBOX_TOP_CROP)
-    print(f"✅ COCO PERSON bbox: {bbox}, conf={pconf:.2f}")
+    # Extract person bounding box from YOLO detections
+    person_box = None
+    for box in yolo_results.boxes.data:
+        cls = int(box[5])
+        if cls == 0:
+            person_box = box[:4].cpu().numpy().astype(int)
+            conf = float(box[4])
+            print(f"Person detected with confidence: {conf:.2f}")
+            break
 
-    print("Starting OpenPose (BODY only)...")
+    if person_box is None:
+        print("No person detected by YOLO.")
+        return False
+
+    # Calculate head position from bounding box top-center
+    x1, y1, x2, y2 = person_box
+    top_x = int((x1 + x2) / 2)  # Center X coordinate
+    top_y = int(y1)  # Top Y coordinate
+    print(f"Infant bounding box: x={x1}-{x2}, y={y1}-{y2}")
+
+    # Step 2: Configure OpenPose parameters for full-body analysis
     params = {
-        "model_folder": OPENPOSE_MODELS,
+        "model_folder": model_dir,
+        "face": True,
+        "hand": True,
         "model_pose": "BODY_25",
-        "face": False,
-        "hand": False,
-        "render_pose": 0,
-        "disable_blending": True,
-        "net_resolution": "656x368",
         "num_gpu": 1,
         "num_gpu_start": 0,
-        "scale_number": 1,
-        "scale_gap": 0.3,
+        "net_resolution": "640x368",
+        "scale_number": 2,
+        "scale_gap": 0.25,
+        "face_net_resolution": "368x368",
+        "hand_net_resolution": "368x368",
         "render_threshold": 0.05,
+        "alpha_pose": 0.6,
+        "render_pose": 2,
+        "disable_blending": False,
     }
 
+    print("Starting OpenPose with FULL features (body + face + hands)...")
+
+    # Initialize and configure OpenPose wrapper
     opWrapper = op.WrapperPython()
     opWrapper.configure(params)
     opWrapper.start()
 
+    # Step 3: Run pose estimation
     try:
+        image = cv2.imread(image_path)
         datum = op.Datum()
-        datum.cvInputData = img
-        opWrapper.emplaceAndPop(op.VectorDatum([datum]))
+        datum.cvInputData = image
+        opWrapper.emplaceAndPop(op.VectorDatum([datum]))  # Process image
+        output_img = datum.cvOutputData
 
         if datum.poseKeypoints is None or len(datum.poseKeypoints) == 0:
-            print("❌ No pose detected by OpenPose.")
+            print("No pose detected by OpenPose.")
+            opWrapper.stop()
             return False
 
-        kps = datum.poseKeypoints[0]
+        print(f"Detected {len(datum.poseKeypoints)} person(s)")
+
+        if datum.faceKeypoints is not None and len(datum.faceKeypoints) > 0:
+            print(f"Face detected: {datum.faceKeypoints.shape}")
+        else:
+            print(f"No face detected")
+
+        if datum.handKeypoints is not None and len(datum.handKeypoints) > 0:
+            print(f"Hands detected")
+        else:
+            print(f"No hands detected")
+
+    except Exception as e:
+        print(f"OpenPose error: {e}")
+        opWrapper.stop()
+        return False
     finally:
         print("Stopping OpenPose wrapper...")
 
-    out = img.copy()
+    # Step 4: Visualize detected keypoints on output image
+    # Draw body keypoints in green with labels
+    draw_keypoints(output_img, datum.poseKeypoints[0], (0, 255, 0), radius=5, label=True)
 
-    # Draw bbox and keypoints
-    x1, y1, x2, y2 = bbox
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 0, 0), 6)
-    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 3)
-    draw_keypoints(out, kps, color=(0, 255, 0), conf_thr=KP_CONF_THR)
+    if datum.faceKeypoints is not None and len(datum.faceKeypoints) > 0:
+        draw_keypoints(output_img, datum.faceKeypoints[0], (255, 255, 0), radius=2, label=False)
+        print("Face keypoints drawn (yellow)")
 
-    # Head
-    anchor = get_head_anchor_from_pose(kps, bbox)
-    top_head = find_top_of_head_edge(out, bbox, anchor)
-    ax, ay = anchor
-    hx, hy = top_head
-    print(f"✅ Anchor=({ax},{ay}) TopHead=({hx},{hy})")
+    if datum.handKeypoints is not None and len(datum.handKeypoints) > 0:
+        try:
+            if datum.handKeypoints[0] is not None and len(datum.handKeypoints[0]) > 0:
+                draw_keypoints(output_img, datum.handKeypoints[0][0], (255, 0, 255), radius=3, label=False)
+                print("Left hand keypoints drawn (magenta)")
+            if datum.handKeypoints[0] is not None and len(datum.handKeypoints[0]) > 1:
+                draw_keypoints(output_img, datum.handKeypoints[0][1], (0, 255, 255), radius=3, label=False)
+                print("Right hand keypoints drawn (cyan)")
+        except:
+            print("Could not draw hand keypoints")
 
-    draw_dot(out, ax, ay, (255, 0, 0), r=8, text="ANCHOR")
-    draw_dot(out, hx, hy, (0, 0, 255), r=10, text="HEAD")
+    # Mark the detected head position from YOLO bounding box
+    cv2.circle(output_img, (top_x, top_y), 8, (0, 0, 255), -1)
+    cv2.circle(output_img, (top_x, top_y), 10, (255, 255, 255), 2)
+    cv2.putText(output_img, "Head", (top_x + 12, top_y - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 3)
+    cv2.putText(output_img, "Head", (top_x + 12, top_y - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    # Torso: HEAD -> point 8 (Y only)
-    torso_y = None
-    if MID_HIP < kps.shape[0] and kp_ok(kps[MID_HIP]):
-        torso_y = float(kps[MID_HIP][1])
-    else:
-        ys = []
-        if R_HIP < kps.shape[0] and kp_ok(kps[R_HIP]): ys.append(float(kps[R_HIP][1]))
-        if L_HIP < kps.shape[0] and kp_ok(kps[L_HIP]): ys.append(float(kps[L_HIP][1]))
-        if ys:
-            torso_y = float(np.mean(ys))
+    # Step 5: Calculate infant length measurement
+    try:
+        # Extract relevant body keypoints from BODY_25 model
+        nose = datum.poseKeypoints[0][0]
+        neck = datum.poseKeypoints[0][1]
+        r_ankle = datum.poseKeypoints[0][11]
+        l_ankle = datum.poseKeypoints[0][14]
+        r_heel = datum.poseKeypoints[0][24]
+        l_heel = datum.poseKeypoints[0][21]
 
-    if torso_y is None:
-        print("❌ Missing pelvis point and hips fallback. Cannot measure.")
+        # Adjust head position for better alignment with actual head top
+        # The YOLO bounding box tends to be slightly off-center
+        head_x = top_x - 50  # Shift left to better center on head
+        head_y = top_y + 20  # Shift down to approximate crown position
+
+        print(f"Original head position: ({top_x}, {top_y})")
+        print(f"Adjusted head position: ({head_x}, {head_y})")
+
+        # Find the lowest detected point among all foot/ankle keypoints
+        lowest_point = None
+        lowest_y = 0
+
+        # Check all foot/ankle points and find the lowest
+        foot_points = [
+            ("right heel", r_heel),
+            ("left heel", l_heel),
+            ("right ankle", r_ankle),
+            ("left ankle", l_ankle)
+        ]
+
+        for name, point in foot_points:
+            if point[2] > 0.05:  # confidence check
+                if point[1] > lowest_y:  # Y coordinate (lower = higher value in image)
+                    lowest_y = point[1]
+                    lowest_point = point
+                    lowest_name = name
+
+        if lowest_point is None:
+            print("Could not detect feet/ankles")
+            opWrapper.stop()
+            return False
+
+        # Define measurement points: vertical line from head to heel projection
+        top_point = (head_x, head_y)
+        bottom_point = (head_x, int(lowest_point[1]))
+
+        print(f"Top point (head): {top_point}")
+        print(f"Bottom point ({lowest_name}): ({int(lowest_point[0])}, {int(lowest_point[1])})")
+        print(f"Projected bottom: {bottom_point}")
+
+        # Visualize the measurement line (vertical distance)
+        cv2.line(output_img, top_point, bottom_point, (0, 0, 0), thickness=5)  # Black outline
+        cv2.line(output_img, top_point, bottom_point, (255, 0, 0), thickness=3)  # Blue line
+
+        # Draw projection guide showing how heel maps to vertical measurement line
+        num_dots = 10
+        for i in range(num_dots):
+            t = i / (num_dots - 1)
+            x = int(lowest_point[0] + t * (bottom_point[0] - lowest_point[0]))
+            y = int(lowest_point[1] + t * (bottom_point[1] - lowest_point[1]))
+            cv2.circle(output_img, (x, y), 2, (0, 255, 255), -1)
+
+        # Calculate pixel distance (straight vertical measurement)
+        total_px = abs(bottom_point[1] - top_point[1])
+
+        print(f"Vertical distance: {total_px:.2f} px")
+        print("Searching for 15cm reference object...")
+
+        # Step 6: Convert pixels to centimeters using reference object
+        pt1, pt2 = get_spatula_Height(image_path=resized_path)
+
+        if pt1 is None or pt2 is None:
+            print("WARNING: No 15cm reference found!")
+            print("Cannot calculate length in cm - pixel measurement only")
+            height_cm = 0
+        else:
+            # Calculate scale factor from reference object
+            pixel_distance = distance(pt1, pt2)
+            known_length_cm = 15.0  # Known physical length of reference
+            scale_cm_per_px = known_length_cm / pixel_distance
+            height_cm = total_px * scale_cm_per_px  # Convert measurement to cm
+
+            print(f"Reference length: {pixel_distance:.2f} pixels = 15.0 cm")
+            print(f"Scale factor: {scale_cm_per_px:.4f} cm/pixel")
+            print(f"INFANT LENGTH: {height_cm:.2f} cm")
+
+            # Visualize the reference object on output image
+            cv2.line(output_img, pt1, pt2, (0, 255, 255), thickness=4)
+            cv2.putText(output_img, "15cm REF", (pt1[0], pt1[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            # Display final measurement on image
+            cv2.putText(output_img, f"Length: {height_cm:.1f} cm",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5)
+            cv2.putText(output_img, f"Length: {height_cm:.1f} cm",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+
+        # Also display pixel measurement for reference
+        cv2.putText(output_img, f"Pixels: {int(total_px)} px",
+                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    except Exception as e:
+        print(f"Error calculating length: {e}")
+        import traceback
+        traceback.print_exc()
+        opWrapper.stop()
         return False
 
-    torso_px = abs(torso_y - float(hy))
-    draw_line(out, (hx, hy), (hx, torso_y), color=(0, 255, 255), thick=5)
+    # Step 7: Save annotated output image
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    out_file = os.path.join(output_path, "result_infant_measurement.png")
+    cv2.imwrite(out_file, output_img)
+    print(f"Output saved to: {out_file}")
 
-    # Legs: heel only, compute both, take max
-    right_leg_px, right_heel = leg_length_polyline_to_heel(kps, R_HIP, R_KNEE, R_ANKLE, R_HEEL)
-    left_leg_px, left_heel = leg_length_polyline_to_heel(kps, L_HIP, L_KNEE, L_ANKLE, L_HEEL)
-
-    candidates = []
-    if right_leg_px is not None:
-        candidates.append(("RIGHT", right_leg_px, right_heel))
-    if left_leg_px is not None:
-        candidates.append(("LEFT", left_leg_px, left_heel))
-
-    if not candidates:
-        print("❌ No valid legs (missing hip/knee/ankle).")
-        return False
-
-    side, leg_px, heel_pt = max(candidates, key=lambda t: t[1])
-
-    if side == "RIGHT":
-        hip, knee, ankle = kps[R_HIP], kps[R_KNEE], kps[R_ANKLE]
-    else:
-        hip, knee, ankle = kps[L_HIP], kps[L_KNEE], kps[L_ANKLE]
-
-    draw_line(out, hip, knee, color=(255, 255, 0), thick=5)
-    draw_line(out, knee, ankle, color=(255, 255, 0), thick=5)
-    if heel_pt is not None:
-        draw_line(out, ankle, heel_pt, color=(255, 255, 0), thick=5)
-        draw_dot(out, heel_pt[0], heel_pt[1], (255, 0, 255), r=10, text="HEEL")
-
-    print(f"Torso px (Y-only head->8): {torso_px:.2f}")
-    print(f"Leg px (polyline + heel): {leg_px:.2f} ({side})")
-    total_px = torso_px + leg_px
-    print(f"Total px: {total_px:.2f}")
-
-    # Spatula scale
-    spat = pick_best_box_by_area(spat_res, target_cls=SPATULA_CLASS_ID, conf_min=0.15)
-    if spat is None:
-        print("⚠️ No spatula detected. Cannot convert to cm.")
-        length_cm = 0.0
-    else:
-        sx1, sy1, sx2, sy2, sconf = spat
-
-        # (Good simple scale) use long side of bbox as spatula px length
-        spatula_px = max(abs(sx2 - sx1), abs(sy2 - sy1))
-        cm_per_px = SPATULA_LENGTH_CM / max(1e-6, spatula_px)
-        length_cm = total_px * cm_per_px
-
-        print(f"Spatula conf={sconf:.2f} spatula_px={spatula_px:.2f} cm_per_px={cm_per_px:.6f}")
-        print(f"INFANT LENGTH: {length_cm:.2f} cm")
-
-        cv2.rectangle(out, (sx1, sy1), (sx2, sy2), (0, 0, 0), 6)
-        cv2.rectangle(out, (sx1, sy1), (sx2, sy2), (0, 255, 255), 3)
-        cv2.putText(out, "SPATULA", (sx1, max(18, sy1 - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-    cv2.putText(out, f"Length: {length_cm:.1f} cm", (20, 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 7)
-    cv2.putText(out, f"Length: {length_cm:.1f} cm", (20, 55),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-
-    out_path = os.path.join(output_dir, "result_infant_measurement.png")
-    cv2.imwrite(out_path, out)
-    print(f"Output saved to: {out_path}")
-
+    # Clean up OpenPose resources
     opWrapper.stop()
     print("GPU memory freed")
-    return length_cm
+
+    return height_cm
+
+
+# ============================================================================
+# Main Execution Block
+# ============================================================================
+if __name__ == "__main__":
+    """
+    Command-line interface for testing the measurement system.
+    
+    Usage:
+        python measured_full_body.py <image_path>
+        
+    Example:
+        python measured_full_body.py input/infant_photo.jpg
+    """
+    import sys
+
+    if len(sys.argv) > 1:
+        test_image = sys.argv[1]
+        if os.path.exists(test_image):
+            result = cal_height(test_image)
+            if result:
+                print(f"\n{'='*50}")
+                print(f"FINAL MEASUREMENT: {result:.2f} cm")
+                print(f"{'='*50}")
+        else:
+            print(f"Error: Image not found: {test_image}")
+            print(f"Usage: python measured_full_body.py <image_path>")
+    else:
+        print("Usage: python measured_full_body.py <image_path>")
+        print("Example: python measured_full_body.py input/infant_photo.jpg")
