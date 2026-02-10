@@ -1,0 +1,26 @@
+[
+  {
+    "name": "captured_20251116_181722",
+    "image": "captured_20251116_181722.jpg",
+    "expected_cm": 34.0,
+    "tolerance_cm": 1.5
+  },
+    {
+    "name": "IMG_7282",
+    "image": "IMG_7282.jpeg",
+    "expected_cm": 38.0,
+    "tolerance_cm": 1.5
+  },
+   {
+    "name": "IMG_7286",
+    "image": "IMG_7286.jpeg",
+    "expected_cm": 36.0,
+    "tolerance_cm": 1.5
+  },
+      {
+    "name": "IMG_7290",
+    "image": "IMG_7290.jpeg",
+    "expected_cm": 28.0,
+    "tolerance_cm": 1.5
+  }
+]
