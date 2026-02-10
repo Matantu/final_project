@@ -20,9 +20,6 @@ Requirements:
     - OpenCV: Camera capture and image processing
     - PIL/Pillow: Image display in GUI
     - measured_full_body: Core measurement module
-
-Author: OpenPose Project
-Date: 2026
 """
 
 import tkinter as tk
