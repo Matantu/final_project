@@ -16,9 +16,6 @@ Dependencies:
     - NumPy: Numerical computations
     - Ultralytics YOLO: Object detection
     - PyOpenPose: Pose estimation
-
-Author: OpenPose Project
-Date: 2026
 """
 
 import sys
