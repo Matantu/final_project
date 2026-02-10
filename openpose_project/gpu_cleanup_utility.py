@@ -7,9 +7,6 @@ or GPU overload. It performs Python garbage collection and clears CUDA cache.
 Usage:
     Run directly: python gpu_cleanup_utility.py
     Or import: from gpu_cleanup_utility import clear_gpu_memory
-
-Author: OpenPose Project
-Date: 2026
 """
 
 import gc
