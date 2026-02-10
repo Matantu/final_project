@@ -1,4 +1,4 @@
-# Infant Length Measurement System (Phase B)
+# Infant Length Measurement System
 
 A standalone **offline** desktop application that estimates **premature infant head-to-heel length** from a **single top‑down RGB image**.
 
@@ -26,28 +26,14 @@ It uses:
 
 ## 2) Quick Start (Project)
 
-### 2.1 Clone / Download
 If using Git:
 ```bash
 git clone https://github.com/Matantu/final_project.git
 cd final_project/openpose_project
 ```
 
-### 2.2 Install Python packages
-```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### 2.3 Configure OpenPose Python path
-This project needs access to `pyopenpose`.
-
-Set one of the following:
-
-**Option A (recommended): environment variable**
 - `OPENPOSE_PYTHON_PATH` = `C:\openpose_build\openpose\build\python\openpose\Release`
 
-**Option B:** edit `config.py` and set `OPENPOSE_PYTHON_PATH`.
 
 ---
 
@@ -84,7 +70,7 @@ python measured_full_body.py --input "input\baby_47cm_01.jpg" --output_dir "outp
 
 ## 5) Notes
 
-- The system is a **feasibility prototype** (Phase B) and was validated in non‑clinical conditions using an infant‑sized doll.
+- The system is a **feasibility prototype**  and was validated in non‑clinical conditions using an infant‑sized doll.
 - No images are uploaded to cloud services; processing is **local/offline**.
 
 ---
@@ -93,8 +79,6 @@ python measured_full_body.py --input "input\baby_47cm_01.jpg" --output_dir "outp
 
 - `openpose_gui_with_output.py` – Tkinter GUI
 - `measured_full_body.py` – core measurement pipeline (YOLO + OpenPose + geometry)
-- `config.py` – configurable paths and thresholds
-- `requirements.txt` – Python dependencies
 - `input/` – sample test images
 - `output/` – generated results (can be empty)
 
