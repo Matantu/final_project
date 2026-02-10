@@ -1,6 +1,15 @@
 """
 GPU Memory Cleanup Utility
-Run this if you experience GPU overload or memory issues
+
+This utility script helps free up GPU memory when experiencing CUDA memory issues
+or GPU overload. It performs Python garbage collection and clears CUDA cache.
+
+Usage:
+    Run directly: python gpu_cleanup_utility.py
+    Or import: from gpu_cleanup_utility import clear_gpu_memory
+
+Author: OpenPose Project
+Date: 2026
 """
 
 import gc
@@ -8,7 +17,21 @@ import torch
 import sys
 
 def clear_gpu_memory():
-    """Force clear GPU memory"""
+    """
+    Force clear GPU memory by performing garbage collection and clearing CUDA cache.
+    
+    This function:
+    1. Runs Python's garbage collector to free Python objects
+    2. Clears CUDA cache if PyTorch and CUDA are available
+    3. Synchronizes CUDA operations
+    4. Reports memory status for each available GPU
+    
+    Returns:
+        None
+        
+    Prints:
+        GPU memory statistics including allocated and reserved memory for each GPU device
+    """
     print("🧹 Clearing GPU memory...")
     
     # Clear Python garbage
